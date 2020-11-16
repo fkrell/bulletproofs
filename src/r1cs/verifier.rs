@@ -4,7 +4,7 @@ use core::borrow::BorrowMut;
 use core::mem;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
-use curve25519_dalek::traits::VartimeMultiscalarMul;
+use curve25519_dalek::traits::{VartimeMultiscalarMul, MultiscalarMul, Identity, IsIdentity};
 use merlin::Transcript;
 
 use super::{
@@ -16,6 +16,7 @@ use crate::errors::R1CSError;
 use crate::generators::{BulletproofGens, PedersenGens};
 use crate::r1cs::Metrics;
 use crate::transcript::TranscriptProtocol;
+use rand_core::{CryptoRng, RngCore};
 
 /// A [`ConstraintSystem`] implementation for use by the verifier.
 ///
@@ -331,28 +332,11 @@ impl<T: BorrowMut<Transcript>> Verifier<T> {
         }
     }
 
-    /// Consume this `VerifierCS` and attempt to verify the supplied `proof`.
-    /// The `pc_gens` and `bp_gens` are generators for Pedersen commitments and
-    /// Bulletproofs vector commitments, respectively.  The
-    /// [`BulletproofGens`] should have `gens_capacity` greater than
-    /// the number of multiplication constraints that will eventually
-    /// be added into the constraint system.
-    pub fn verify(
-        self,
-        proof: &R1CSProof,
-        pc_gens: &PedersenGens,
-        bp_gens: &BulletproofGens,
-    ) -> Result<(), R1CSError> {
-        self.verify_and_return_transcript(proof, pc_gens, bp_gens)
-            .map(|_| ())
-    }
-    /// Same as `verify`, but also returns the transcript back to the user.
-    pub fn verify_and_return_transcript(
+    pub(super) fn get_scalars(
         mut self,
         proof: &R1CSProof,
-        pc_gens: &PedersenGens,
         bp_gens: &BulletproofGens,
-    ) -> Result<T, R1CSError> {
+    ) -> Result<(Self, Vec<Scalar>), R1CSError> {
         // Commit a length _suffix_ for the number of high-level variables.
         // We cannot do this in advance because user can commit variables one-by-one,
         // but this suffix provides safe disambiguation because each variable
@@ -383,8 +367,6 @@ impl<T: BorrowMut<Transcript>> Verifier<T> {
         if bp_gens.gens_capacity < padded_n {
             return Err(R1CSError::InvalidGeneratorsLength);
         }
-        // We are performing a single-party circuit proof, so party index is 0.
-        let gens = bp_gens.share(0);
 
         // These points are the identity in the 1-phase unrandomized case.
         transcript.append_point(b"A_I2", &proof.A_I2);
@@ -439,13 +421,14 @@ impl<T: BorrowMut<Transcript>> Verifier<T> {
         let u_for_h = u_for_g.clone();
 
         // define parameters for P check
-        let g_scalars = yneg_wR
+        let g_scalars: Vec<_> = yneg_wR
             .iter()
             .zip(u_for_g)
             .zip(s.iter().take(padded_n))
-            .map(|((yneg_wRi, u_or_1), s_i)| u_or_1 * (x * yneg_wRi - a * s_i));
+            .map(|((yneg_wRi, u_or_1), s_i)| u_or_1 * (x * yneg_wRi - a * s_i))
+            .collect();
 
-        let h_scalars = y_inv_vec
+        let h_scalars: Vec<_> = y_inv_vec
             .iter()
             .zip(u_for_h)
             .zip(s.iter().rev().take(padded_n))
@@ -453,7 +436,8 @@ impl<T: BorrowMut<Transcript>> Verifier<T> {
             .zip(wO.into_iter().chain(iter::repeat(Scalar::zero()).take(pad)))
             .map(|((((y_inv_i, u_or_1), s_i_inv), wLi), wOi)| {
                 u_or_1 * (y_inv_i * (x * wLi + wOi - b * s_i_inv) - Scalar::one())
-            });
+            })
+            .collect();
 
         // Create a `TranscriptRng` from the transcript. The verifier
         // has no witness data to commit, so this just mixes external
@@ -472,48 +456,197 @@ impl<T: BorrowMut<Transcript>> Verifier<T> {
 
         // group the T_scalars and T_points together
         let T_scalars = [r * x, rxx * x, rxx * xx, rxx * xxx, rxx * xx * xx];
+
+        let mut scalars: Vec<Scalar> = vec![];
+        scalars.push(w * (proof.t_x - a * b) + r * (xx * (wc + delta) - proof.t_x));
+        scalars.push(-proof.e_blinding - r * proof.t_x_blinding);
+        scalars.extend_from_slice(&g_scalars);
+        scalars.extend_from_slice(&h_scalars);
+        scalars.extend_from_slice(&[x, xx, xxx, u * x, u * xx, u * xxx]);
+        scalars.extend_from_slice(&T_scalars);
+        for wVi in wV.iter() {
+            scalars.push(wVi * rxx);
+        }
+        scalars.extend_from_slice(&u_sq);
+        scalars.extend_from_slice(&u_inv_sq);
+        Ok((self, scalars))
+    }
+
+    /// Consume this `VerifierCS` and attempt to verify the supplied `proof`.
+    /// The `pc_gens` and `bp_gens` are generators for Pedersen commitments and
+    /// Bulletproofs vector commitments, respectively.  The
+    /// [`BulletproofGens`] should have `gens_capacity` greater than
+    /// the number of multiplication constraints that will eventually
+    /// be added into the constraint system.
+    pub fn verify(
+        self,
+        proof: &R1CSProof,
+        pc_gens: &PedersenGens,
+        bp_gens: &BulletproofGens,
+    ) -> Result<(), R1CSError> {
+        self.verify_and_return_transcript(proof, pc_gens, bp_gens)
+            .map(|_| ())
+    }
+    /// Same as `verify`, but also returns the transcript back to the user.
+    pub fn verify_and_return_transcript(
+        mut self,
+        proof: &R1CSProof,
+        pc_gens: &PedersenGens,
+        bp_gens: &BulletproofGens,
+    ) -> Result<T, R1CSError> {
+        let (verifier, scalars) = self.get_scalars(proof, bp_gens)?;
+        self = verifier;
         let T_points = [proof.T_1, proof.T_3, proof.T_4, proof.T_5, proof.T_6];
 
+        // We are performing a single-party circuit proof, so party index is 0.
+        let gens = bp_gens.share(0);
+
+        let padded_n = self.num_vars.next_power_of_two();
+
+        use std::iter;
         let mega_check = RistrettoPoint::optional_multiscalar_mul(
-            iter::once(x) // A_I1
-                .chain(iter::once(xx)) // A_O1
-                .chain(iter::once(xxx)) // S1
-                .chain(iter::once(u * x)) // A_I2
-                .chain(iter::once(u * xx)) // A_O2
-                .chain(iter::once(u * xxx)) // S2
-                .chain(wV.iter().map(|wVi| wVi * rxx)) // V
-                .chain(T_scalars.iter().cloned()) // T_points
-                .chain(iter::once(
-                    w * (proof.t_x - a * b) + r * (xx * (wc + delta) - proof.t_x),
-                )) // B
-                .chain(iter::once(-proof.e_blinding - r * proof.t_x_blinding)) // B_blinding
-                .chain(g_scalars) // G
-                .chain(h_scalars) // H
-                .chain(u_sq.iter().cloned()) // ipp_proof.L_vec
-                .chain(u_inv_sq.iter().cloned()), // ipp_proof.R_vec
-            iter::once(proof.A_I1.decompress())
+            scalars,
+            iter::once(Some(pc_gens.B))
+                .chain(iter::once(Some(pc_gens.B_blinding)))
+                .chain(gens.G(padded_n).map(|&G_i| Some(G_i)))
+                .chain(gens.H(padded_n).map(|&H_i| Some(H_i)))
+                .chain(iter::once(proof.A_I1.decompress()))
                 .chain(iter::once(proof.A_O1.decompress()))
                 .chain(iter::once(proof.S1.decompress()))
                 .chain(iter::once(proof.A_I2.decompress()))
                 .chain(iter::once(proof.A_O2.decompress()))
                 .chain(iter::once(proof.S2.decompress()))
-                .chain(self.V.iter().map(|V_i| V_i.decompress()))
-                .chain(T_points.iter().map(|T_i| T_i.decompress()))
-                .chain(iter::once(Some(pc_gens.B)))
-                .chain(iter::once(Some(pc_gens.B_blinding)))
-                .chain(gens.G(padded_n).map(|&G_i| Some(G_i)))
-                .chain(gens.H(padded_n).map(|&H_i| Some(H_i)))
+              .chain(T_points.iter().map(|T_i| T_i.decompress()))
+              .chain(self.V.iter().map(|V_i| V_i.decompress()))
                 .chain(proof.ipp_proof.L_vec.iter().map(|L_i| L_i.decompress()))
                 .chain(proof.ipp_proof.R_vec.iter().map(|R_i| R_i.decompress())),
         )
-        .ok_or_else(|| R1CSError::VerificationError)?;
-
-        use curve25519_dalek::traits::IsIdentity;
+            .ok_or_else(|| R1CSError::VerificationError)?;
 
         if !mega_check.is_identity() {
             return Err(R1CSError::VerificationError);
         }
-
         Ok(self.transcript)
     }
+}
+
+/// Batch verification of R1CS proofs
+pub fn verify_batch<'t, 'p, Inst, Rng: CryptoRng>(
+    verifiers_and_proofs: Inst,
+    bp_gens: &BulletproofGens,
+    pc_gens: &PedersenGens,
+    prng: &mut Rng,
+) -> Result<(), R1CSError>
+ where
+   Inst: IntoIterator<Item = (Verifier<&'t mut Transcript>, &'p R1CSProof)>,
+   Rng: CryptoRng + RngCore
+
+{
+    let mut vers_and_pfs: Vec<(Verifier<_>,_)> = vec![];
+    let mut verification_scalars = vec![];
+    let mut n = 0usize;
+    // 1. obtain max number of variables among instances, padded to the smaller greater power of two
+    // 2. Save all instance scalars.
+    for (verifier, proof) in verifiers_and_proofs.into_iter() {
+        // verification_scalars method is mutable, need to run before obtaining verifier.num_vars
+        let (verifier, instance_scalars) = verifier.get_scalars(proof, bp_gens)?;
+        let n_i = verifier.num_vars.next_power_of_two();
+        if n_i > n {
+            n = n_i;
+        }
+        verification_scalars.push(instance_scalars);
+        vers_and_pfs.push((verifier, proof));
+    }
+    let gens = bp_gens.share(0);
+
+    // 3. set common bases and init their matching scalars
+    let mut multiexp_bases = vec![];
+    multiexp_bases.push(pc_gens.B);
+    multiexp_bases.push(pc_gens.B_blinding);
+    multiexp_bases.extend(gens.G(n));
+    multiexp_bases.extend(gens.H(n));
+
+    let mut multiexp_scalars = vec![Scalar::zero(); 2 * n + 2];
+
+    for ((verifier, proof), instance_scalars) in vers_and_pfs.into_iter()
+        .zip(verification_scalars.iter())
+    {
+        let instance_factor = Scalar::random(prng);
+        let scaled_scalars: Vec<Scalar> = instance_scalars.into_iter().map(|s| instance_factor * s).collect();
+        group_scalars(&mut multiexp_scalars, &scaled_scalars, verifier.num_vars);
+        group_bases(&mut multiexp_bases, verifier, proof)?;
+    }
+
+    let multi_exp = RistrettoPoint::multiscalar_mul(multiexp_scalars, multiexp_bases);
+    if multi_exp != RistrettoPoint::identity() {
+        Err(R1CSError::VerificationError)
+    } else {
+        Ok(())
+    }
+}
+
+fn group_scalars(
+    mexp_scalars: &mut Vec<Scalar>,
+    scaled_scalars: &[Scalar],
+    n: usize,
+) {
+    let padded_n = n.next_power_of_two();
+    mexp_scalars[0] += scaled_scalars[0]; // add scalar to first pedersen base
+    mexp_scalars[1] += scaled_scalars[1]; // add scalar to second pedersen base
+    // g values
+    let mut offset = 2;
+    let len = padded_n;
+    for (s, scaled_scalar) in mexp_scalars[offset .. offset + len].iter_mut().zip(scaled_scalars[offset .. offset + len].iter()) {
+        *s += scaled_scalar;
+    }
+    // h values
+    offset += len;
+    let offset_mexp = 2 + n;
+    for (s, scaled_scalar) in mexp_scalars[offset_mexp .. offset_mexp + len].iter_mut().zip(scaled_scalars[offset .. offset + len].iter()) {
+        *s += scaled_scalar;
+    }
+    offset += len;
+    mexp_scalars.extend(scaled_scalars[offset..].iter());
+}
+
+fn group_bases<'t>(
+    mexp_bases: &mut Vec<RistrettoPoint>,
+    verifier: Verifier<&'t mut Transcript>,
+    proof: &R1CSProof
+) -> Result<(), R1CSError> {
+    let proof_bases: Result<Vec<RistrettoPoint>, R1CSError> = [
+        proof.A_I1,
+        proof.A_O1,
+        proof.S1,
+        proof.A_I2,
+        proof.A_O2,
+        proof.S2,
+        proof.T_1,
+        proof.T_3,
+        proof.T_4,
+        proof.T_5,
+        proof.T_6
+    ].iter().map(|x| x.decompress().ok_or(R1CSError::FormatError)).collect();
+    mexp_bases.extend(proof_bases?.iter());
+    let V: Result<Vec<RistrettoPoint>, R1CSError> = verifier
+      .V
+      .iter()
+      .map(|Vi| Vi.decompress().ok_or(R1CSError::FormatError))
+      .collect();
+    mexp_bases.extend_from_slice(V?.as_slice());
+    let L_vec: Vec<_> = proof
+      .ipp_proof
+      .L_vec
+      .iter()
+      .map(|L| L.decompress().unwrap())
+      .collect();
+    let R_vec: Vec<_> = proof
+      .ipp_proof
+      .R_vec
+      .iter()
+      .map(|R| R.decompress().unwrap())
+      .collect();
+    mexp_bases.extend_from_slice(&L_vec);
+    mexp_bases.extend_from_slice(&R_vec);
+    Ok(())
 }

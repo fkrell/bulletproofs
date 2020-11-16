@@ -452,3 +452,57 @@ fn range_proof_helper(v_val: u64, n: usize) -> Result<(), R1CSError> {
     // Verifier verifies proof
     verifier.verify(&proof, &pc_gens, &bp_gens)
 }
+
+#[test]
+pub fn batch_verify(){
+
+    // Common
+    let pc_gens = PedersenGens::default();
+    let bp_gens = BulletproofGens::new(128, 1);
+
+    // (2 + 4) * (1 + 3) = (20 + 4)
+    let (proof1, commitments1) = example_gadget_proof(&pc_gens, &bp_gens, 2, 4, 1, 3, 20, 4).unwrap();
+    // (10 + 10) * (5 + 2) = (100 + 40)
+    let (proof2, commitments2) = example_gadget_proof(&pc_gens, &bp_gens, 10, 10, 5, 2, 100, 40).unwrap();
+
+    let mut transcript1 = Transcript::new(b"R1CSExampleGadget");
+    let mut transcript2 = Transcript::new(b"R1CSExampleGadget");
+
+    // 1. Create a verifiers
+    let mut verifier1 = Verifier::new(&mut transcript1);
+    let mut verifier2 = Verifier::new(&mut transcript2);
+
+    // 2. Commit high-level variables
+    let vars1: Vec<_> = commitments1.iter().map(|V| verifier1.commit(*V)).collect();
+    let vars2: Vec<_> = commitments2.iter().map(|V| verifier2.commit(*V)).collect();
+
+    // 3. Build a CS
+    example_gadget(
+        &mut verifier1,
+        vars1[0].into(),
+        vars1[1].into(),
+        vars1[2].into(),
+        vars1[3].into(),
+        vars1[4].into(),
+        Scalar::from(4u32).into(),
+    );
+    example_gadget(
+        &mut verifier2,
+        vars2[0].into(),
+        vars2[1].into(),
+        vars2[2].into(),
+        vars2[3].into(),
+        vars2[4].into(),
+        Scalar::from(40u32).into(),
+    );
+
+    let verifiers = vec![verifier1, verifier2];
+    let proofs = vec![proof1, proof2];
+    let instances = verifiers.into_iter().zip(proofs.iter());
+    // 4. Verify the proof
+    assert!(verify_batch(
+        instances,
+        &bp_gens,
+        &pc_gens,
+        &mut thread_rng()).is_ok());
+}

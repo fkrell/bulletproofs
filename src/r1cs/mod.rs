@@ -18,5 +18,6 @@ pub use self::metrics::Metrics;
 pub use self::proof::R1CSProof;
 pub use self::prover::Prover;
 pub use self::verifier::Verifier;
+pub use self::verifier::verify_batch;
 
 pub use crate::errors::R1CSError;
