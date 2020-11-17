@@ -516,8 +516,8 @@ impl<T: BorrowMut<Transcript>> Verifier<T> {
                 .chain(iter::once(proof.A_I2.decompress()))
                 .chain(iter::once(proof.A_O2.decompress()))
                 .chain(iter::once(proof.S2.decompress()))
-              .chain(T_points.iter().map(|T_i| T_i.decompress()))
-              .chain(self.V.iter().map(|V_i| V_i.decompress()))
+                .chain(T_points.iter().map(|T_i| T_i.decompress()))
+                .chain(self.V.iter().map(|V_i| V_i.decompress()))
                 .chain(proof.ipp_proof.L_vec.iter().map(|L_i| L_i.decompress()))
                 .chain(proof.ipp_proof.R_vec.iter().map(|R_i| R_i.decompress())),
         )
@@ -573,7 +573,7 @@ pub fn verify_batch<'t, 'p, Inst, Rng: CryptoRng>(
     {
         let instance_factor = Scalar::random(prng);
         let scaled_scalars: Vec<Scalar> = instance_scalars.into_iter().map(|s| instance_factor * s).collect();
-        group_scalars(&mut multiexp_scalars, &scaled_scalars, verifier.num_vars);
+        group_scalars(&mut multiexp_scalars, &scaled_scalars, verifier.num_vars.next_power_of_two(), n);
         group_bases(&mut multiexp_bases, verifier, proof)?;
     }
 
@@ -588,9 +588,9 @@ pub fn verify_batch<'t, 'p, Inst, Rng: CryptoRng>(
 fn group_scalars(
     mexp_scalars: &mut Vec<Scalar>,
     scaled_scalars: &[Scalar],
-    n: usize,
+    padded_n: usize,
+    max_n: usize,
 ) {
-    let padded_n = n.next_power_of_two();
     mexp_scalars[0] += scaled_scalars[0]; // add scalar to first pedersen base
     mexp_scalars[1] += scaled_scalars[1]; // add scalar to second pedersen base
     // g values
@@ -601,7 +601,7 @@ fn group_scalars(
     }
     // h values
     offset += len;
-    let offset_mexp = 2 + n;
+    let offset_mexp = 2 + max_n;
     for (s, scaled_scalar) in mexp_scalars[offset_mexp .. offset_mexp + len].iter_mut().zip(scaled_scalars[offset .. offset + len].iter()) {
         *s += scaled_scalar;
     }
@@ -627,13 +627,11 @@ fn group_bases<'t>(
         proof.T_5,
         proof.T_6
     ].iter().map(|x| x.decompress().ok_or(R1CSError::FormatError)).collect();
-    mexp_bases.extend(proof_bases?.iter());
     let V: Result<Vec<RistrettoPoint>, R1CSError> = verifier
       .V
       .iter()
       .map(|Vi| Vi.decompress().ok_or(R1CSError::FormatError))
       .collect();
-    mexp_bases.extend_from_slice(V?.as_slice());
     let L_vec: Vec<_> = proof
       .ipp_proof
       .L_vec
@@ -646,6 +644,9 @@ fn group_bases<'t>(
       .iter()
       .map(|R| R.decompress().unwrap())
       .collect();
+
+    mexp_bases.extend_from_slice(V?.as_slice());
+    mexp_bases.extend(proof_bases?.iter());
     mexp_bases.extend_from_slice(&L_vec);
     mexp_bases.extend_from_slice(&R_vec);
     Ok(())
