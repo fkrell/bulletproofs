@@ -595,17 +595,21 @@ fn group_scalars(
     mexp_scalars[1] += scaled_scalars[1]; // add scalar to second pedersen base
     // g values
     let mut offset = 2;
-    let len = padded_n;
-    for (s, scaled_scalar) in mexp_scalars[offset .. offset + len].iter_mut().zip(scaled_scalars[offset .. offset + len].iter()) {
+    let mut mexp_offset = 2;
+    for (s, scaled_scalar) in mexp_scalars[mexp_offset .. mexp_offset + padded_n]
+      .iter_mut()
+      .zip(scaled_scalars[offset .. offset + padded_n].iter()) {
         *s += scaled_scalar;
     }
     // h values
-    offset += len;
-    let offset_mexp = 2 + max_n;
-    for (s, scaled_scalar) in mexp_scalars[offset_mexp .. offset_mexp + len].iter_mut().zip(scaled_scalars[offset .. offset + len].iter()) {
+    offset += padded_n;
+    mexp_offset += max_n;
+    for (s, scaled_scalar) in mexp_scalars[mexp_offset .. mexp_offset + padded_n]
+      .iter_mut()
+      .zip(scaled_scalars[offset .. offset + padded_n].iter()) {
         *s += scaled_scalar;
     }
-    offset += len;
+    offset += padded_n;
     mexp_scalars.extend(scaled_scalars[offset..].iter());
 }
 
@@ -644,9 +648,8 @@ fn group_bases<'t>(
       .iter()
       .map(|R| R.decompress().unwrap())
       .collect();
-
-    mexp_bases.extend_from_slice(V?.as_slice());
     mexp_bases.extend(proof_bases?.iter());
+    mexp_bases.extend_from_slice(V?.as_slice());
     mexp_bases.extend_from_slice(&L_vec);
     mexp_bases.extend_from_slice(&R_vec);
     Ok(())
