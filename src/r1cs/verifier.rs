@@ -605,7 +605,7 @@ fn group_scalars(
     for (s, scaled_scalar) in mexp_scalars[offset_mexp .. offset_mexp + len].iter_mut().zip(scaled_scalars[offset .. offset + len].iter()) {
         *s += scaled_scalar;
     }
-    offset += len;
+    offset += n;
     mexp_scalars.extend(scaled_scalars[offset..].iter());
 }
 
